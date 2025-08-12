@@ -31,6 +31,19 @@ return [
 
     'connections' => [
 
+        'supabase' => [
+            'driver' => 'pgsql',
+            'host' => env('SUPABASE_HOST'),
+            'port' => env('SUPABASE_PORT', '5432'),
+            'database' => env('SUPABASE_DATABASE'),
+            'username' => env('SUPABASE_USERNAME'),
+            'password' => env('SUPABASE_PASSWORD'),
+            'charset' => 'utf8',
+            'prefix' => '',
+            'schema' => 'public',
+            'sslmode' => 'require',
+        ],
+
         'sqlite' => [
             'driver' => 'sqlite',
             'url' => env('DB_URL'),
@@ -147,7 +160,7 @@ return [
 
         'options' => [
             'cluster' => env('REDIS_CLUSTER', 'redis'),
-            'prefix' => env('REDIS_PREFIX', Str::slug((string) env('APP_NAME', 'laravel')).'-database-'),
+            'prefix' => env('REDIS_PREFIX', Str::slug((string) env('APP_NAME', 'laravel')) . '-database-'),
             'persistent' => env('REDIS_PERSISTENT', false),
         ],
 
