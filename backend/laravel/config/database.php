@@ -31,19 +31,6 @@ return [
 
     'connections' => [
 
-        'supabase' => [
-            'driver' => 'pgsql',
-            'host' => env('SUPABASE_HOST'),
-            'port' => env('SUPABASE_PORT', '5432'),
-            'database' => env('SUPABASE_DATABASE'),
-            'username' => env('SUPABASE_USERNAME'),
-            'password' => env('SUPABASE_PASSWORD'),
-            'charset' => 'utf8',
-            'prefix' => '',
-            'schema' => 'public',
-            'sslmode' => 'require',
-        ],
-
         'sqlite' => [
             'driver' => 'sqlite',
             'url' => env('DB_URL'),
@@ -97,18 +84,19 @@ return [
 
         'pgsql' => [
             'driver' => 'pgsql',
-            'url' => env('DB_URL'),
+            'url' => env('DATABASE_URL'), // This line reads DATABASE_URL
             'host' => env('DB_HOST', '127.0.0.1'),
             'port' => env('DB_PORT', '5432'),
-            'database' => env('DB_DATABASE', 'laravel'),
-            'username' => env('DB_USERNAME', 'root'),
+            'database' => env('DB_DATABASE', 'forge'),
+            'username' => env('DB_USERNAME', 'forge'),
             'password' => env('DB_PASSWORD', ''),
-            'charset' => env('DB_CHARSET', 'utf8'),
+            'charset' => 'utf8',
             'prefix' => '',
             'prefix_indexes' => true,
-            'search_path' => 'public',
+            'schema' => 'public',
             'sslmode' => 'prefer',
         ],
+
 
         'sqlsrv' => [
             'driver' => 'sqlsrv',
