@@ -1,31 +1,18 @@
-// Force Node runtime (pg doesn't work on Edge)
+// app/api/locations/route.js
 export const runtime = 'nodejs';
-
 import { NextResponse } from 'next/server';
-import { Pool } from 'pg';
-
-// Reuse one pool across invocations
-const pool = new Pool({
-  connectionString: process.env.POSTGRES_URL,
-  ssl: { rejectUnauthorized: false }, // Supabase uses SSL
-  max: 1, // keep it tiny in dev / serverless
-});
+import { createClient } from '@supabase/supabase-js';
 
 export async function GET() {
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        id,
-        name,
-        latitude::float8 AS latitude,
-        longitude::float8 AS longitude,
-        created_at
-      FROM public.locations
-      ORDER BY created_at ASC
-    `);
-    return NextResponse.json(rows);
-  } catch (err) {
-    console.error('DB error:', err);
-    return NextResponse.json({ error: 'DB query failed' }, { status: 500 });
-  }
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  );
+  const { data, error } = await supabase
+    .from('locations')
+    .select('*')
+    .order('created_at', { ascending: true });
+
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  return NextResponse.json(data);
 }
