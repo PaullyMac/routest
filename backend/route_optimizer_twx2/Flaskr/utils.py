@@ -209,6 +209,7 @@ def simulate_route(data):
     api_url = 'http://127.0.0.1:5000/api/update_tracker'
     route_points = list(data['route_details']['geometry']['coordinates'])
     destinations = data['route_details']['properties']['destinations']
+    
 
     while route_points:
         url_data = {

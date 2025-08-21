@@ -7,6 +7,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
+import Link from "next/link";
 
 const ROUTER_MODE = process.env.NEXT_PUBLIC_ROUTER_MODE || "osrm";
 const ROUTE_API_BASE = process.env.NEXT_PUBLIC_ROUTE_API_BASE || "http://127.0.0.1:5055/api";
@@ -41,6 +42,23 @@ export default function Page() {
   const [routeSummary, setRouteSummary] = useState(null); // {originName,destName,km,min}
   const [routeSteps, setRouteSteps] = useState([]); // [{maneuver,modifier,name,distance,duration}]
   const [optimized, setOptimized] = useState(false);
+
+  // Map progress
+  const fullRouteRef = useRef(null);        // full polyline from backend result
+  const progressDoneRef = useRef(null);     // driven segment
+  const progressRemainRef = useRef(null);   // remaining segment
+  const orderLayerRef = useRef(null);       // order layer
+
+  // SSE connection state
+  const [connStatus, setConnStatus] = useState('idle'); // 'idle' | 'connecting' | 'connected' | 'error'
+  const [lastSseAt, setLastSseAt] = useState(null);     // timestamp (ms)
+  const [retries, setRetries] = useState(0);
+
+  const desiredChannelRef = useRef(null);   // non-null means we want to stay connected
+  const reconnectTimerRef = useRef(null);   // holds setTimeout id
+
+  const connecting = connStatus === 'connecting';
+  const connected  = connStatus === 'connected';
 
   // Supabase client
   const supabase = useMemo(
@@ -173,7 +191,13 @@ export default function Page() {
 
     (async () => {
       const L = (await import("leaflet")).default;
-
+      // Guard against re-init on Fast Refresh / remount
+      const container = L.DomUtil.get("leaflet-map");
+      if (container) {
+        // If a map was previously attached to this DOM node, remove its id
+        // so Leaflet doesn't throw "Map container is already initialized."
+        container._leaflet_id = null;
+      }
       // Default marker icon (CDN paths)
       const DefaultIcon = L.Icon.Default;
       DefaultIcon.mergeOptions({
@@ -223,6 +247,11 @@ export default function Page() {
     return () => {
       if (ro) ro.disconnect();
       if (onResize) window.removeEventListener("resize", onResize);
+      // Properly tear down Leaflet on unmount / page switch
+      if (mapRef.current) {
+        try { mapRef.current.remove(); } catch {}
+        mapRef.current = null;
+      }
     };
   }, []);
 
@@ -265,6 +294,13 @@ export default function Page() {
     };
   }, []); // run only on unmount
 
+  // Update last SSE timestamp
+  useEffect(() => {
+    if (!connected) return;
+    const id = setInterval(() => { /* trigger re-render */ setLastSseAt((t) => t ? t : Date.now()); }, 1000);
+    return () => clearInterval(id);
+  }, [connected]);
+
   // Geolocation helper
   const ensureGeolocation = async () => {
     if (!("geolocation" in navigator)) {
@@ -292,11 +328,43 @@ export default function Page() {
     });
   };
 
-const handleCalculate = async () => {
-  setErrorMsg("");
-  setRouting(true);
-  setOptimized(false);
-  try {
+  const clearOrderLayer = () => {
+    const map = mapRef.current;
+    if (map && orderLayerRef.current) {
+      try { map.removeLayer(orderLayerRef.current); } catch {}
+      orderLayerRef.current = null;
+    }
+  };
+
+  const showOptimizedOrderBadges = (feature) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const L = require('leaflet');
+
+    clearOrderLayer();
+    orderLayerRef.current = L.layerGroup().addTo(map);
+
+    const props = feature?.properties || {};
+    const order = props.optimized_order || [];
+    const dests = props.destinations || [];
+    if (!order.length || !dests.length) return;
+
+    order.forEach((idx, i) => {
+      const d = dests[idx];
+      if (!d) return;
+      const el = document.createElement('div');
+      el.className = 'bg-indigo-600 text-white text-[10px] font-bold rounded-full w-5 h-5 grid place-items-center border border-white shadow';
+      el.innerText = String(i + 1);
+      const icon = L.divIcon({ html: el, className: 'order-badge', iconSize: [20, 20] });
+      L.marker([d.lat, d.lon], { icon }).addTo(orderLayerRef.current);
+    });
+  };
+
+  const handleCalculate = async () => {
+    setErrorMsg("");
+    setRouting(true);
+    setOptimized(false);
+    try {
     // --- Resolve origin
     let originCoords = null;
     if (originId === "__current_location__") {
@@ -335,6 +403,7 @@ const handleCalculate = async () => {
            destIds
          );
         lastFeatureRef.current = feature;
+        showOptimizedOrderBadges(feature);
 
         // analytics
         const sum = feature?.properties?.summary || {};
@@ -367,6 +436,7 @@ const handleCalculate = async () => {
         if (!map) return;
         if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
         routeLayerRef.current = L.polyline(latlngs, { weight: 5, opacity: 0.95 }).addTo(map);
+        fullRouteRef.current = routeLayerRef.current;
         map.fitBounds(routeLayerRef.current.getBounds().pad(0.2));
         setTimeout(() => map.invalidateSize(), 0);
         return; // success via backend; skip OSRM
@@ -453,14 +523,40 @@ const handleCalculate = async () => {
     URL.revokeObjectURL(url);
   };
 
+  const clearReconnectTimer = () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  };
+
+  const backoffMs = (n) => {
+    const base = Math.min(1000 * (2 ** n), 20000); // 1s, 2s, 4s, ... max 20s
+    const jitter = Math.floor(Math.random() * 250);
+    return base + jitter;
+  };
+
   const stopTracking = () => {
-    setTracking(false);
+    desiredChannelRef.current = null;   // <- stops auto-reconnect
+    clearReconnectTimer();
+
     try { sseRef.current?.close?.(); } catch {}
     sseRef.current = null;
 
+    // clear markers/lines
     const map = mapRef.current;
-    if (map && trackerMarkerRef.current) map.removeLayer(trackerMarkerRef.current);
+    if (map) {
+      if (trackerMarkerRef.current) map.removeLayer(trackerMarkerRef.current);
+      if (progressDoneRef.current)  map.removeLayer(progressDoneRef.current);
+      if (progressRemainRef.current) map.removeLayer(progressRemainRef.current);
+    }
     trackerMarkerRef.current = null;
+    progressDoneRef.current = null;
+    progressRemainRef.current = null;
+
+    setTracking(false);
+    setConnStatus('idle');
+    setRetries(0);
   };
 
   const startTracking = (channel) => {
@@ -468,45 +564,94 @@ const handleCalculate = async () => {
       setToast({ type: 'info', message: 'Set a channel (use Vehicle ID or type one).' });
       return;
     }
-    // clean old
-    stopTracking();
 
-    const url = `${SSE_BASE}/api/realtime_feed?channel=${encodeURIComponent(channel)}`;
-    const es = new EventSource(url);
-    sseRef.current = es;
+    // If already connecting/connected to the same channel, ignore
+    if (desiredChannelRef.current === channel && (connecting || connected)) return;
+
+    // Reset and mark desire to stay connected
+    stopTracking();
+    desiredChannelRef.current = channel;
+    setConnStatus('connecting');
     setTracking(true);
 
-    es.onopen = () => setToast?.({ type: 'info', message: `SSE connected: ${channel}` });
-    es.onerror = () => {
-      setToast?.({ type: 'error', message: 'SSE connection error' });
-      stopTracking();
-    };
+    const openEventSource = () => {
+      // Make sure we still want to connect
+      if (!desiredChannelRef.current) return;
 
-    es.onmessage = (ev) => {
-      try {
-        const payload = JSON.parse(ev.data);
-        const next = (payload.remaining_routes && payload.remaining_routes[0]) || null;
-        const latlng = lonlatToLatLng(next);
-        const map = mapRef.current;
-        if (!map || !latlng) return;
+      const url = `${SSE_BASE}/api/realtime_feed?channel=${encodeURIComponent(desiredChannelRef.current)}`;
+      const es = new EventSource(url);
+      sseRef.current = es;
 
-        const L = require('leaflet');
-        if (!trackerMarkerRef.current) {
-          trackerMarkerRef.current = L.circleMarker(latlng, { radius: 6, opacity: 0.9 })
-            .addTo(map)
-            .bindTooltip('Live tracker', { direction: 'top', offset: [0, -8] });
-        } else {
-          trackerMarkerRef.current.setLatLng(latlng);
+      es.onopen = () => {
+        setConnStatus('connected');
+        setRetries(0);
+        setToast?.({ type: 'info', message: `SSE connected: ${desiredChannelRef.current}` });
+      };
+
+      es.onmessage = (ev) => {
+        setLastSseAt(Date.now());
+        try {
+          const payload = JSON.parse(ev.data);
+
+          // --- marker update
+          const next = (payload.remaining_routes && payload.remaining_routes[0]) || null;
+          const latlng = lonlatToLatLng(next);
+          const map = mapRef.current;
+          if (map && latlng) {
+            const L = require('leaflet');
+            if (!trackerMarkerRef.current) {
+              trackerMarkerRef.current = L.circleMarker(latlng, { radius: 6, opacity: 0.95 })
+                .addTo(map)
+                .bindTooltip('Live tracker', { direction: 'top', offset: [0, -8] });
+            } else {
+              trackerMarkerRef.current.setLatLng(latlng);
+            }
+          }
+
+          // --- progress lines
+          const feature = lastFeatureRef.current;
+          const all = feature?.geometry?.coordinates || [];
+          const rem = payload.remaining_routes || [];
+          if (map && all.length > 0) {
+            const { done, remaining } = splitProgressByRemaining(all, rem);
+            const L = require('leaflet');
+
+            if (!progressDoneRef.current) {
+              progressDoneRef.current  = L.polyline(done, { weight: 6, opacity: 0.9, color: '#16a34a' }).addTo(map);
+            } else {
+              progressDoneRef.current.setLatLngs(done);
+            }
+            if (!progressRemainRef.current) {
+              progressRemainRef.current = L.polyline(remaining, { weight: 6, opacity: 0.4, dashArray: '6,6', color: '#334155' }).addTo(map);
+            } else {
+              progressRemainRef.current.setLatLngs(remaining);
+            }
+          }
+        } catch (e) {
+          console.warn('SSE parse error:', e);
         }
-      } catch (e) {
-        console.warn('SSE parse error:', e);
-      }
+      };
+
+      es.onerror = () => {
+        // If user manually stopped, do nothing
+        if (!desiredChannelRef.current) return;
+
+        // Close current es and schedule a backoff reconnect
+        try { es.close(); } catch {}
+        sseRef.current = null;
+
+        setConnStatus('error');
+        setRetries((n) => {
+          const next = n + 1;
+          const delay = backoffMs(next);
+          clearReconnectTimer();
+          reconnectTimerRef.current = setTimeout(openEventSource, delay);
+          return next;
+        });
+      };
     };
 
-    es.onerror = () => {
-      setToast({ type: 'error', message: 'SSE connection error. Check backend /realtime_feed CORS.' });
-      stopTracking();
-    };
+    openEventSource();
   };
 
   const handleSimulate = async () => {
@@ -580,6 +725,15 @@ const handleCalculate = async () => {
             <span className="text-sm text-slate-500" aria-live="polite">
               Last Updated: {lastUpdated ? new Date(lastUpdated).toLocaleString() : "—"}
             </span>
+              <Link
+                href="/ui/history"
+                target="_blank"
+                rel="noopener noreferrer"
+                prefetch={false}
+                className="hidden md:flex items-center justify-center w-28 h-10 rounded-xl bg-white border shadow-sm text-sm hover:bg-slate-50"
+              >
+                History
+              </Link>
             <button className="hidden md:flex items-center justify-center w-10 h-10 rounded-xl bg-white border shadow-sm">
               <SettingsIcon className="w-5 h-5" />
             </button>
@@ -813,7 +967,16 @@ const handleCalculate = async () => {
           {/* Live tracker + export */}
           <div className="mt-6 space-y-3">
             <div className="text-sm font-semibold text-slate-700">Live Tracker (SSE)</div>
-
+              <span className="flex items-center gap-2 text-xs text-slate-600">
+                <span className={`inline-block w-2 h-2 rounded-full ${
+                  connected ? 'bg-green-500' : connecting ? 'bg-amber-500' : 'bg-slate-400'
+                }`} />
+                {connected ? 'Connected' : connecting ? 'Connecting…' : 'Disconnected'}
+                <span className="text-slate-400">•</span>
+                <span title={lastSseAt ? new Date(lastSseAt).toLocaleString() : ''}>
+                  Last msg: {lastSseAt ? new Date(lastSseAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '—'}
+                </span>
+              </span>
             {/* make the row wrap and keep buttons visible */}
             <div className="flex flex-wrap gap-2">
               <input
@@ -825,23 +988,25 @@ const handleCalculate = async () => {
               <button
                 type="button"
                 onClick={() => startTracking(sseChannel || vehicleId)}
-                disabled={tracking}
+                disabled={connecting || connected}
                 className={`shrink-0 px-3 py-2 rounded-xl border shadow-sm ${
-                  tracking ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
+                  (connecting || connected) ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
                 }`}
               >
-                Connect
+                {connecting ? 'Connecting…' : 'Connect'}
               </button>
+
               <button
                 type="button"
                 onClick={stopTracking}
-                disabled={!tracking}
+                disabled={!connecting && !connected}
                 className={`shrink-0 px-3 py-2 rounded-xl border shadow-sm ${
-                  !tracking ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
+                  (!connecting && !connected) ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
                 }`}
               >
                 Disconnect
               </button>
+
             </div>
 
             <div className="flex flex-wrap gap-2">
@@ -1309,6 +1474,42 @@ function getSelectedValues(selectEl) {
   return Array.from(selectEl.selectedOptions).map(o => o.value);
 }
 
+function splitProgressByRemaining(allLonLat = [], remainingLonLat = []) {
+  // We assume remaining is a suffix of the full path from simulate_route.
+  const remLen = remainingLonLat.length;
+  const doneLen = Math.max(0, allLonLat.length - remLen);
+  const done = allLonLat.slice(0, doneLen).map(([lon, lat]) => [lat, lon]);
+  const remaining = allLonLat.slice(doneLen).map(([lon, lat]) => [lat, lon]);
+  return { done, remaining };
+}
+
+function showOptimizedOrderBadges(feature) {
+  const map = mapRef.current;
+  if (!map) return;
+  const L = require('leaflet');
+
+  // clear old
+  if (orderLayerRef.current) {
+    try { map.removeLayer(orderLayerRef.current); } catch {}
+  }
+  orderLayerRef.current = L.layerGroup().addTo(map);
+
+  const props = feature?.properties || {};
+  const order = props.optimized_order || [];
+  const dests = props.destinations || [];
+  if (!order.length || !dests.length) return;
+
+  order.forEach((idx, i) => {
+    const d = dests[idx];
+    if (!d) return;
+    const el = document.createElement('div');
+    el.className = 'bg-indigo-600 text-white text-[10px] font-bold rounded-full w-5 h-5 grid place-items-center border border-white shadow';
+    el.innerText = (i + 1).toString();
+    const icon = L.divIcon({ html: el, className: 'order-badge', iconSize: [20, 20] });
+    L.marker([d.lat, d.lon], { icon }).addTo(orderLayerRef.current);
+  });
+}
+
 async function callBackendOptimizeRoute(originCoords, destCoordsList, vehicleId, vehicleType, originIdValue, destIdsValue) {
   const payload = {
     source_point: toLonLat(originCoords),
@@ -1346,4 +1547,3 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
-

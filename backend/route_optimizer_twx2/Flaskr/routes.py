@@ -104,14 +104,9 @@ def ping():
     return jsonify({"ok": True, "service": "route-optimizer"}), 200
 
 
-# --- NEW: helper to persist to Supabase via PostgREST ---
+# --- helper to persist to Supabase via PostgREST ---
 def persist_request_and_result(payload: dict, feature: dict):
-    """
-    Inserts into route_requests and route_results.
-    Returns the request_id (uuid) or None on failure.
-    """
     if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
-        # Not configured: skip persistence silently
         return None
 
     meta = payload.get("meta") or {}
@@ -121,15 +116,17 @@ def persist_request_and_result(payload: dict, feature: dict):
     }
     req_row = {
         "origin_id": meta.get("origin_id"),
-        "stops": stops,            # jsonb
-        "status": "completed",     # or "pending" then update later
+        "stops": stops,            # jsonb NOT NULL
+        "status": "completed",
     }
 
     r = requests.post(f"{REST}/route_requests", headers=HEADERS, json=req_row, timeout=20)
-    r.raise_for_status()
+    if not r.ok:
+        print("route_requests insert failed:", r.status_code, r.text)   # <— show body
+        r.raise_for_status()
     request_id = r.json()[0]["id"]
 
-    props = feature.get("properties", {}) or {}
+    props = (feature or {}).get("properties", {}) or {}
     summary = props.get("summary", {}) or {}
     legs = props.get("segments", []) or []
 
@@ -137,10 +134,112 @@ def persist_request_and_result(payload: dict, feature: dict):
         "request_id": request_id,
         "total_distance": float(summary.get("distance") or 0),
         "total_duration": float(summary.get("duration") or 0),
-        "optimized_order": props.get("optimized_order") or [],   # jsonb
-        "legs": legs,                                            # jsonb
+        "optimized_order": props.get("optimized_order") or [],
+        "legs": legs,
+        "geometry": feature.get("geometry") or None,
     }
     r2 = requests.post(f"{REST}/route_results", headers=HEADERS, json=result_row, timeout=20)
-    r2.raise_for_status()
+    if not r2.ok:
+        print("route_results insert failed:", r2.status_code, r2.text)
+        r2.raise_for_status()
 
     return request_id
+
+# --- route history ---
+@route_bp.route("/history", methods=["GET"])
+def history():
+    try:
+        limit = int(request.args.get("limit", 20))
+    except ValueError:
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    # Your schema: id, origin_id, stops, request_time, status
+    # route_results has created_at, totals, optimized_order
+    params = {
+        "select": (
+            "id,request_time,origin_id,stops,"
+            "route_results(id,total_distance,total_duration,optimized_order,created_at)"
+        ),
+        "order": "request_time.desc",
+        "limit": str(limit),
+    }
+
+    try:
+        r = requests.get(f"{REST}/route_requests", headers=HEADERS, params=params, timeout=20)
+        r.raise_for_status()
+        rows = r.json()
+    except requests.RequestException as e:
+        status = getattr(e.response, "status_code", "n/a")
+        text = getattr(e.response, "text", str(e))
+        return jsonify({"error": f"supabase fetch failed (status {status}): {text}"}), 500
+
+    items = []
+    for rr in rows:
+        res = rr.get("route_results") or []
+        first = res[0] if res else {}
+        stops = rr.get("stops") or {}
+        dest_ids = stops.get("destination_ids") or []
+        items.append({
+            "request_id": rr["id"],
+            "created_at": rr.get("request_time"),   # <- from your schema
+            "origin_id": rr.get("origin_id"),
+            "dest_count": len(dest_ids),
+            "total_distance": first.get("total_distance"),
+            "total_duration": first.get("total_duration"),
+            "optimized": bool(first.get("optimized_order") or []),
+        })
+
+    return jsonify({"items": items}), 200
+
+# --- History detail ----------------------------------------------------------
+@route_bp.route("/history/<req_id>", methods=["GET"])
+def history_detail(req_id):
+    """
+    Returns one saved route request + its (first) result.
+    Shape:
+    {
+      "request": { id, origin_id, stops, status, request_time },
+      "result":  { total_distance, total_duration, optimized_order, legs, created_at }
+    }
+    """
+    if not (REST and SUPABASE_SERVICE_KEY):
+        return jsonify({"error": "history disabled: SUPABASE not configured"}), 503
+
+    try:
+        r = requests.get(
+            f"{REST}/route_requests",
+            headers=HEADERS,
+            params={
+                # include the embedded 1:N results as an array `route_results`
+                "select": "id,origin_id,stops,status,request_time,"
+                          "route_results(id,total_distance,total_duration,optimized_order,legs,created_at)",
+                "id": f"eq.{req_id}",
+                "limit": "1",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return jsonify({"error": "not found"}), 404
+
+        req = rows[0]
+        results = req.get("route_results") or []
+        res = results[0] if results else None
+
+        return jsonify({
+            "request": {
+                "id": req["id"],
+                "origin_id": req.get("origin_id"),
+                "stops": req.get("stops") or {},
+                "status": req.get("status"),
+                "request_time": req.get("request_time"),
+            },
+            "result": res
+        }), 200
+
+    except requests.RequestException as e:
+        status = getattr(e.response, "status_code", "n/a")
+        text = getattr(e.response, "text", str(e))
+        return jsonify({"error": f"supabase fetch failed (status {status}): {text}"}), 500
