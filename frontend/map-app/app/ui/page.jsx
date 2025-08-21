@@ -15,9 +15,12 @@ export default function Page() {
   // ---- App State
   const [mapReady, setMapReady] = useState(false);
   const [originId, setOriginId] = useState(""); // uuid | "__current_location__"
-  const [destId, setDestId] = useState("");
+  const MAX_STOPS = 10;
+  const [destIds, setDestIds] = useState([]); // array of uuid
   const [vehicleId, setVehicleId] = useState(""); // ephemeral
+  const [vehicleType, setVehicleType] = useState('car'); // 'car' | 'hgv' | 'bike' | 'roadbike' | 'foot'
   const [filter, setFilter] = useState("all"); // all | mall | warehouse
+  const [health, setHealth] = useState(null);
 
   const [locations, setLocations] = useState([]); // [{id,name,latitude,longitude,created_at}]
   const [loadingLocations, setLoadingLocations] = useState(true);
@@ -37,6 +40,7 @@ export default function Page() {
   // Route details
   const [routeSummary, setRouteSummary] = useState(null); // {originName,destName,km,min}
   const [routeSteps, setRouteSteps] = useState([]); // [{maneuver,modifier,name,distance,duration}]
+  const [optimized, setOptimized] = useState(false);
 
   // Supabase client
   const supabase = useMemo(
@@ -52,15 +56,23 @@ export default function Page() {
   const classify = (name = "") =>
     name.toLowerCase().includes("warehouse") ? "warehouse" : "mall";
 
-  const filteredLocations = useMemo(
-    () => (filter === "all" ? locations : locations.filter((l) => classify(l.name) === filter)),
-    [locations, filter]
-  );
+  const [q, setQ] = useState("");
+
+  const filteredLocations = useMemo(() => {
+    const query = q.trim().toLowerCase();
+    return locations.filter((l) => {
+      const typeOk = filter === "all" ? true : classify(l.name) === filter;
+      const textOk = !query ? true : l.name.toLowerCase().includes(query);
+      return typeOk && textOk;
+    });
+  }, [locations, filter, q]);
 
   const distanceText = useMemo(
     () => (distanceKm == null ? "--" : `${distanceKm.toFixed(1)}`),
     [distanceKm]
   );
+
+  const [saved, setSaved] = useState(false);
 
   const durationText = useMemo(() => {
     if (durationMin == null) return "--";
@@ -79,12 +91,45 @@ export default function Page() {
   const markersRef = useRef(null);
   const routeLayerRef = useRef(null);
 
+  // SSE base URL
+  const SSE_BASE =
+  (process.env.NEXT_PUBLIC_ROUTE_API_BASE || '').replace(/\/api$/, '') ||
+  'http://127.0.0.1:5000';
+
+  // Refs
+  const lastFeatureRef = useRef(null);   // store last backend feature for simulate/export
+  const sseRef = useRef(null);
+  const trackerMarkerRef = useRef(null);
+
+  // SSE channel
+  const [sseChannel, setSseChannel] = useState('');   // defaults to vehicleId when set
+  const [tracking, setTracking] = useState(false);
+  
   // Toast auto-dismiss
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(null), 5000);
     return () => clearTimeout(t);
   }, [toast]);
+
+  // Health check
+  useEffect(() => {
+    let canceled = false;
+
+    const load = async () => {
+      try {
+        const res = await fetch('/api/health', { cache: 'no-store' });
+        const json = await res.json();
+        if (!canceled) setHealth(json.checks || null);
+      } catch {
+        if (!canceled) setHealth(null);
+      }
+    };
+
+    load();                      // initial
+    const id = setInterval(load, 30000); // repeat
+    return () => { canceled = true; clearInterval(id); };
+  }, []);
 
   // Fetch locations
   useEffect(() => {
@@ -213,6 +258,13 @@ export default function Page() {
     });
   }, [filteredLocations]);
 
+  // Cleanup SSE + marker on unmount / route change
+  useEffect(() => {
+    return () => {
+      stopTracking();
+    };
+  }, []); // run only on unmount
+
   // Geolocation helper
   const ensureGeolocation = async () => {
     if (!("geolocation" in navigator)) {
@@ -240,105 +292,145 @@ export default function Page() {
     });
   };
 
-  // Routing via OSRM demo
 const handleCalculate = async () => {
   setErrorMsg("");
   setRouting(true);
+  setOptimized(false);
   try {
-    // Resolve origin & destination coords (unchanged)
+    // --- Resolve origin
     let originCoords = null;
     if (originId === "__current_location__") {
       originCoords = geo || (await ensureGeolocation());
       if (!originCoords) return;
     } else {
       const o = locations.find((l) => l.id === originId);
-      if (!o) return setErrorMsg("Select a valid origin.");
+      if (!o) {
+        setErrorMsg("Select a valid origin.");
+        return;
+      }
       originCoords = { lat: +o.latitude, lng: +o.longitude };
     }
 
-    const d = locations.find((l) => l.id === destId);
-    if (!d) return setErrorMsg("Select a valid destination.");
-    const destCoords = { lat: +d.latitude, lng: +d.longitude };
+    // --- Resolve destinations
+    const destRows = destIds.map((id) => locations.find((l) => l.id === id)).filter(Boolean);
+    if (destRows.length === 0) {
+      setErrorMsg("Select at least one destination.");
+      return;
+    }
+    if (destIds.includes(originId)) {
+      setErrorMsg("Origin cannot also be a destination.");
+      return;
+    }
+    const destCoordsList = destRows.map((r) => ({ lat: +r.latitude, lng: +r.longitude }));
 
-    // Branch: backend vs OSRM
+    // --- Try backend first (when enabled)
     if (ROUTER_MODE === "backend") {
-      // ---- Backend (OpenRouteService via your Flask server)
-      const feature = await callBackendOptimizeRoute(originCoords, destCoords, vehicleId);
+      try {
+        const feature = await callBackendOptimizeRoute(
+           originCoords,
+           destCoordsList,
+           vehicleId,
+           vehicleType,
+           originId,
+           destIds
+         );
+        lastFeatureRef.current = feature;
 
-      // analytics
-      const sum = feature?.properties?.summary || {};
-      const km = (sum.distance || 0) / 1000;
-      const min = (sum.duration || 0) / 60;
-      setDistanceKm(km);
-      setDurationMin(min);
-      setEta(new Date(Date.now() + (sum.duration || 0) * 1000));
-      setLastUpdated(Date.now());
+        // analytics
+        const sum = feature?.properties?.summary || {};
+        const km = (sum.distance || 0) / 1000;
+        const min = (sum.duration || 0) / 60;
+        setDistanceKm(km);
+        setDurationMin(min);
+        setEta(new Date(Date.now() + (sum.duration || 0) * 1000));
+        setLastUpdated(Date.now());
+        setOptimized(Boolean(feature?.properties?.optimized_order?.length));
+        setSaved(Boolean(feature?.properties?.request_id));
 
-      // steps from segments/steps
-      setRouteSteps(stepsFromORS(feature));
+        // steps
+        setRouteSteps(stepsFromORS(feature));
 
-      // summary header
-      const oName = originId === "__current_location__"
-        ? "My Current Location"
-        : locations.find((l) => l.id === originId)?.name || "Origin";
-      setRouteSummary({ originName: oName, destName: d.name, km, min });
+        // summary header
+        const oName =
+          originId === "__current_location__"
+            ? "My Current Location"
+            : locations.find((l) => l.id === originId)?.name || "Origin";
+        const firstDest = destRows[0]?.name || "Destination";
+        const label = destRows.length === 1 ? firstDest : `${firstDest} + ${destRows.length - 1} more`;
+        setRouteSummary({ originName: oName, destName: label, km, min });
 
-      // draw polyline
-      const coords = feature?.geometry?.coordinates || []; // [lon, lat]
-      const latlngs = coords.map(([lon, lat]) => [lat, lon]);
-      const L = require("leaflet");
-      const map = mapRef.current;
-      if (!map) return;
-      if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
-      routeLayerRef.current = L.polyline(latlngs, { weight: 5, opacity: 0.95 }).addTo(map);
-      map.fitBounds(routeLayerRef.current.getBounds().pad(0.2));
-      setTimeout(() => map.invalidateSize(), 0);
+        // draw polyline
+        const coords = feature?.geometry?.coordinates || []; // [lon, lat]
+        const latlngs = coords.map(([lon, lat]) => [lat, lon]);
+        const L = require("leaflet");
+        const map = mapRef.current;
+        if (!map) return;
+        if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
+        routeLayerRef.current = L.polyline(latlngs, { weight: 5, opacity: 0.95 }).addTo(map);
+        map.fitBounds(routeLayerRef.current.getBounds().pad(0.2));
+        setTimeout(() => map.invalidateSize(), 0);
+        return; // success via backend; skip OSRM
+      } catch (err) {
+        console.error(err);
+        setToast({ type: "info", message: "Backend unavailable — fell back to OSRM." });
+        // fall through to OSRM below
+      }
+    }
 
-    } else {
-      // ---- OSRM (current behavior)
-      const base = process.env.NEXT_PUBLIC_OSRM_URL || "https://router.project-osrm.org";
-      const url = `${base}/route/v1/driving/${originCoords.lng},${originCoords.lat};${destCoords.lng},${destCoords.lat}?overview=full&geometries=geojson&steps=true`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error("OSRM request failed");
-      const json = await res.json();
-      const route = json?.routes?.[0];
-      if (!route) throw new Error("No route found");
+    // --- OSRM path (fallback or when ROUTER_MODE !== 'backend')
+    lastFeatureRef.current = null; // OSRM result isn't used by simulator
+    const base = process.env.NEXT_PUBLIC_OSRM_URL || "https://router.project-osrm.org";
+    const coordsSeq = [
+      `${originCoords.lng},${originCoords.lat}`,
+      ...destCoordsList.map((p) => `${p.lng},${p.lat}`),
+    ].join(";");
+    const url = `${base}/route/v1/driving/${coordsSeq}?overview=full&geometries=geojson&steps=true`;
 
-      const km = route.distance / 1000;
-      const min = route.duration / 60;
-      setDistanceKm(km);
-      setDurationMin(min);
-      setEta(new Date(Date.now() + route.duration * 1000));
-      setLastUpdated(Date.now());
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("OSRM request failed");
+    const json = await res.json();
+    const route = json?.routes?.[0];
+    if (!route) throw new Error("No route found");
 
-      const steps = [];
-      (route.legs || []).forEach((leg) => {
-        (leg.steps || []).forEach((s) => {
-          steps.push({
-            maneuver: s.maneuver?.type || "",
-            name: s.name || "Unnamed road",
-            distance: s.distance,
-            duration: s.duration,
-          });
+    setOptimized(false);
+
+    const km = route.distance / 1000;
+    const min = route.duration / 60;
+    setDistanceKm(km);
+    setDurationMin(min);
+    setEta(new Date(Date.now() + route.duration * 1000));
+    setLastUpdated(Date.now());
+
+    const steps = [];
+    (route.legs || []).forEach((leg) => {
+      (leg.steps || []).forEach((s) => {
+        steps.push({
+          maneuver: s.maneuver?.type || "",
+          name: s.name || "Unnamed road",
+          distance: s.distance,
+          duration: s.duration,
         });
       });
-      setRouteSteps(steps);
+    });
+    setRouteSteps(steps);
 
-      const oName = originId === "__current_location__"
+    const oName =
+      originId === "__current_location__"
         ? "My Current Location"
         : locations.find((l) => l.id === originId)?.name || "Origin";
-      setRouteSummary({ originName: oName, destName: d.name, km, min });
+    const firstDest = destRows[0]?.name || "Destination";
+    const label = destRows.length === 1 ? firstDest : `${firstDest} + ${destRows.length - 1} more`;
+    setRouteSummary({ originName: oName, destName: label, km, min });
 
-      const coords = route.geometry?.coordinates || [];
-      const latlngs = coords.map(([lng, lat]) => [lat, lng]);
-      const L = require("leaflet");
-      const map = mapRef.current;
-      if (!map) return;
-      if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
-      routeLayerRef.current = L.polyline(latlngs, { weight: 5, opacity: 0.95 }).addTo(map);
-      map.fitBounds(routeLayerRef.current.getBounds().pad(0.2));
-      setTimeout(() => map.invalidateSize(), 0);
-    }
+    const coords = route.geometry?.coordinates || [];
+    const latlngs = coords.map(([lng, lat]) => [lat, lng]);
+    const L = require("leaflet");
+    const map = mapRef.current;
+    if (!map) return;
+    if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
+    routeLayerRef.current = L.polyline(latlngs, { weight: 5, opacity: 0.95 }).addTo(map);
+    map.fitBounds(routeLayerRef.current.getBounds().pad(0.2));
+    setTimeout(() => map.invalidateSize(), 0);
   } catch (e) {
     console.error(e);
     setErrorMsg(e?.message || "Routing failed. Please try again.");
@@ -347,8 +439,100 @@ const handleCalculate = async () => {
   }
 };
 
+  const canCalculate = Boolean(originId && destIds.length > 0);
 
-  const canCalculate = Boolean(originId && destId);
+    // --- helpers used by SSE ---
+  const lonlatToLatLng = (pair) => (Array.isArray(pair) && pair.length >= 2 ? [pair[1], pair[0]] : null);
+
+  const downloadJson = (obj, filename = 'route.geojson') => {
+    if (!obj) return;
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const stopTracking = () => {
+    setTracking(false);
+    try { sseRef.current?.close?.(); } catch {}
+    sseRef.current = null;
+
+    const map = mapRef.current;
+    if (map && trackerMarkerRef.current) map.removeLayer(trackerMarkerRef.current);
+    trackerMarkerRef.current = null;
+  };
+
+  const startTracking = (channel) => {
+    if (!channel) {
+      setToast({ type: 'info', message: 'Set a channel (use Vehicle ID or type one).' });
+      return;
+    }
+    // clean old
+    stopTracking();
+
+    const url = `${SSE_BASE}/api/realtime_feed?channel=${encodeURIComponent(channel)}`;
+    const es = new EventSource(url);
+    sseRef.current = es;
+    setTracking(true);
+
+    es.onopen = () => setToast?.({ type: 'info', message: `SSE connected: ${channel}` });
+    es.onerror = () => {
+      setToast?.({ type: 'error', message: 'SSE connection error' });
+      stopTracking();
+    };
+
+    es.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        const next = (payload.remaining_routes && payload.remaining_routes[0]) || null;
+        const latlng = lonlatToLatLng(next);
+        const map = mapRef.current;
+        if (!map || !latlng) return;
+
+        const L = require('leaflet');
+        if (!trackerMarkerRef.current) {
+          trackerMarkerRef.current = L.circleMarker(latlng, { radius: 6, opacity: 0.9 })
+            .addTo(map)
+            .bindTooltip('Live tracker', { direction: 'top', offset: [0, -8] });
+        } else {
+          trackerMarkerRef.current.setLatLng(latlng);
+        }
+      } catch (e) {
+        console.warn('SSE parse error:', e);
+      }
+    };
+
+    es.onerror = () => {
+      setToast({ type: 'error', message: 'SSE connection error. Check backend /realtime_feed CORS.' });
+      stopTracking();
+    };
+  };
+
+  const handleSimulate = async () => {
+    if (!lastFeatureRef.current) {
+      setToast({ type: 'info', message: 'Compute a route via backend first.' });
+      return;
+    }
+    try {
+      const res = await fetch(`${ROUTE_API_BASE}/confirm_route`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          driver_details: {
+            driver_name: (sseChannel || vehicleId || 'Driver-1'),
+            vehicle_type: (typeof vehicleType === 'string' ? vehicleType : 'car'),
+          },
+          route_details: lastFeatureRef.current,
+        }),
+      });
+      if (!res.ok) throw new Error(`Simulate failed (${res.status})`);
+      setToast({ type: 'info', message: 'Simulation started. Connecting SSE…' });
+      startTracking(sseChannel || vehicleId || 'Driver-1');
+    } catch (e) {
+      setToast({ type: 'error', message: e.message || 'Simulation failed' });
+    }
+  };
 
   // ---- Render
   return (
@@ -367,10 +551,32 @@ const handleCalculate = async () => {
           </div>
           <div className="flex items-center gap-4">
             {errorMsg && <span className="text-sm text-red-600">{errorMsg}</span>}
-            <div className="flex items-center gap-2 text-sm text-slate-600">
-              <span className="inline-block w-2 h-2 rounded-full bg-green-500" />
-              Live Data
-            </div>
+              <div className="flex items-center gap-3 text-xs">
+                <StatusDot
+                  ok={health?.backend?.ok}
+                  label="Backend"
+                  title={health?.backend?.status ? `HTTP ${health.backend.status}` : ''}
+                />
+                <StatusDot
+                  ok={health?.osrm?.ok}
+                  label="OSRM"
+                  title={
+                    health?.osrm?.status
+                      ? `HTTP ${health.osrm.status} / ${health?.osrm?.distanceKm?.toFixed?.(1) ?? '--'} km`
+                      : ''
+                  }
+                />
+                <StatusDot
+                  ok={health?.supabase?.ok}
+                  label="DB"
+                  title={health?.supabase?.total != null ? `${health.supabase.total} rows` : ''}
+                />
+                <StatusDot
+                  ok={health?.tiles?.osm?.ok && health?.tiles?.carto?.ok}
+                  label="Tiles"
+                  title={`OSM:${health?.tiles?.osm?.status ?? '?'} Carto:${health?.tiles?.carto?.status ?? '?'}`}
+                />
+              </div>
             <span className="text-sm text-slate-500" aria-live="polite">
               Last Updated: {lastUpdated ? new Date(lastUpdated).toLocaleString() : "—"}
             </span>
@@ -424,6 +630,34 @@ const handleCalculate = async () => {
               </div>
             )}
 
+              {/* Search */}
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">
+                  Search locations
+                </label>
+                <div className="relative">
+                  <input
+                    value={q}
+                    onChange={(e) => setQ(e.target.value)}
+                    placeholder="Search by name…"
+                    className="w-full px-4 py-3 rounded-2xl border bg-white focus:outline-none focus:ring-2 focus:ring-yellow-400 pr-10"
+                  />
+                  {q && (
+                    <button
+                      type="button"
+                      onClick={() => setQ("")}
+                      className="absolute inset-y-0 right-0 px-3 text-slate-400 hover:text-slate-600"
+                      aria-label="Clear search"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {filteredLocations.length} match{filteredLocations.length === 1 ? "" : "es"}
+                </div>
+              </div>
+              
             {/* Inputs */}
             <div className="space-y-5">
               {/* Origin */}
@@ -456,32 +690,43 @@ const handleCalculate = async () => {
                 </div>
               </div>
 
-              {/* Destination */}
+              {/* Destinations (multi) */}
               <div>
-                <label htmlFor="destination-select" className="block text-sm font-semibold text-slate-700 mb-2">
-                  To
+                <label htmlFor="destinations-select" className="block text-sm font-semibold text-slate-700 mb-2">
+                  To (select up to {MAX_STOPS})
                 </label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-slate-400">
                     <NavigationIcon className="w-5 h-5" />
                   </div>
-                  <select
-                    id="destination-select"
-                    value={destId}
-                    onChange={(e) => setDestId(e.target.value)}
-                    disabled={loadingLocations}
-                    aria-disabled={loadingLocations}
-                    className="w-full pl-12 pr-4 py-4 rounded-2xl border bg-white focus:outline-none focus:ring-2 focus:ring-yellow-400 disabled:opacity-60"
-                  >
-                    <option value="" disabled>
-                      {loadingLocations ? "Loading…" : "Select destination…"}
-                    </option>
-                    {filteredLocations.map((l) => (
-                      <option key={l.id} value={l.id}>
-                        {l.name}
-                      </option>
-                    ))}
-                  </select>
+                    <select
+                      multiple
+                      size={Math.min(6, Math.max(3, filteredLocations.length))}
+                      id="destinations-select"
+                      value={destIds}
+                      onChange={(e) => {
+                        const vals = getSelectedValues(e.target)
+                          .filter(v => v)                      // no blanks
+                          .filter(v => v !== originId);        // prevent selecting origin as a stop
+                        if (vals.length > MAX_STOPS) {
+                          setToast({ type: "info", message: `Max ${MAX_STOPS} stops.` });
+                          return;
+                        }
+                        setDestIds(vals);
+                      }}
+                      disabled={loadingLocations}
+                      aria-disabled={loadingLocations}
+                      className="w-full pl-12 pr-4 py-4 rounded-2xl border bg-white focus:outline-none focus:ring-2 focus:ring-yellow-400 disabled:opacity-60"
+                    >
+                      {filteredLocations.map((l) => (
+                        <option key={l.id} value={l.id} disabled={l.id === originId}>
+                          {l.name}
+                        </option>
+                      ))}
+                    </select>
+                </div>
+                <div className="mt-2 text-xs text-slate-500">
+                  Selected stops: <span className="font-medium">{destIds.length}</span> / {MAX_STOPS}
                 </div>
               </div>
 
@@ -504,6 +749,22 @@ const handleCalculate = async () => {
                 </div>
               </div>
             </div>
+
+              {/* Vehicle Type */}
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">
+                  Vehicle Type
+                </label>
+                <select
+                  value={vehicleType}
+                  onChange={(e) => setVehicleType(e.target.value)}
+                  className="w-full px-4 py-3 rounded-2xl border bg-white focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                >
+                  {['car','hgv','bike','roadbike','foot'].map(v => (
+                    <option key={v} value={v}>{v}</option>
+                  ))}
+                </select>
+              </div>
 
             {/* Filters */}
             <div>
@@ -548,6 +809,65 @@ const handleCalculate = async () => {
                 Last Updated <span className="font-medium">{lastUpdated ? "Just now" : "—"}</span>
               </div>
             </div>
+            
+          {/* Live tracker + export */}
+          <div className="mt-6 space-y-3">
+            <div className="text-sm font-semibold text-slate-700">Live Tracker (SSE)</div>
+
+            {/* make the row wrap and keep buttons visible */}
+            <div className="flex flex-wrap gap-2">
+              <input
+                value={sseChannel}
+                onChange={(e) => setSseChannel(e.target.value)}
+                placeholder="Channel (defaults to Vehicle ID)"
+                className="flex-[1_1_220px] min-w-[160px] px-3 py-2 rounded-xl border bg-white focus:outline-none focus:ring-2 focus:ring-yellow-400"
+              />
+              <button
+                type="button"
+                onClick={() => startTracking(sseChannel || vehicleId)}
+                disabled={tracking}
+                className={`shrink-0 px-3 py-2 rounded-xl border shadow-sm ${
+                  tracking ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
+                }`}
+              >
+                Connect
+              </button>
+              <button
+                type="button"
+                onClick={stopTracking}
+                disabled={!tracking}
+                className={`shrink-0 px-3 py-2 rounded-xl border shadow-sm ${
+                  !tracking ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
+                }`}
+              >
+                Disconnect
+              </button>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleSimulate}
+                disabled={!lastFeatureRef.current || ROUTER_MODE !== 'backend'}
+                className={`flex-1 min-w-[160px] px-3 py-2 rounded-xl border shadow-sm ${
+                  (!lastFeatureRef.current || ROUTER_MODE !== 'backend') ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
+                }`}
+                title={ROUTER_MODE !== 'backend' ? 'Run backend route first' : ''}
+              >
+                ▶ Simulate
+              </button>
+              <button
+                type="button"
+                onClick={() => downloadJson(lastFeatureRef.current, 'route.geojson')}
+                disabled={!lastFeatureRef.current}
+                className={`flex-1 min-w-[160px] px-3 py-2 rounded-xl border shadow-sm ${
+                  !lastFeatureRef.current ? 'opacity-50 cursor-not-allowed' : 'bg-white hover:bg-slate-50'
+                }`}
+              >
+                ⤓ Export GeoJSON
+              </button>
+            </div>
+          </div>
           </aside>
 
           {/* RIGHT PANE — fill height; inner div is the ONLY scroller */}
@@ -614,8 +934,25 @@ const handleCalculate = async () => {
               <div className="bg-white rounded-3xl border shadow-sm overflow-hidden">
                 <div className="px-6 py-4 border-b flex items-center justify-between">
                   <div className="text-base font-semibold">Route Details</div>
-                  <div className="text-xs text-slate-500">Summary & Steps</div>
+                  <div className="flex items-center gap-2">
+                    {saved && (
+                      <span className="ml-2 inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                        ✓ Saved
+                      </span>
+                    )}
+                    {optimized && (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 text-xs font-medium"
+                        title="Optimized stop order applied"
+                      >
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                        Optimized
+                      </span>
+                    )}
+                    <span className="text-xs text-slate-500">Summary &amp; Steps</span>
+                  </div>
                 </div>
+
                 {/* internal scroller so very long step lists don't balloon the page */}
                 <div className="max-h-[45vh] overflow-y-auto">
                   {routeSummary ? (
@@ -681,6 +1018,20 @@ function DashboardCard({ title, icon, value, hint }) {
   );
 }
 
+function StatusDot({ ok, label, title }) {
+  const color =
+    ok === true ? "bg-green-500" :
+    ok === false ? "bg-red-500" :
+    "bg-slate-400";
+
+  return (
+    <span className="inline-flex items-center gap-1 text-xs text-slate-600" title={title || ""}>
+      <span className={`inline-block w-2 h-2 rounded-full ${color}`} />
+      {label}
+    </span>
+  );
+}
+
 /** Step icon for route maneuvers (tiny inline SVGs) */
 function StepIcon({ type = "", modifier = "" }) {
   const t = type.toLowerCase();
@@ -716,6 +1067,7 @@ function StepIcon({ type = "", modifier = "" }) {
 
   if (t === "depart") return <DepartIcon className={cls} />;
   if (t === "arrive") return <ArriveIcon className={cls} />;
+
 
   // fallback
   return <DotIcon className={cls} />;
@@ -953,16 +1305,25 @@ function stepsFromORS(feature) {
   return steps;
 }
 
-async function callBackendOptimizeRoute(originCoords, destCoords, vehicleId) {
+function getSelectedValues(selectEl) {
+  return Array.from(selectEl.selectedOptions).map(o => o.value);
+}
+
+async function callBackendOptimizeRoute(originCoords, destCoordsList, vehicleId, vehicleType, originIdValue, destIdsValue) {
   const payload = {
     source_point: toLonLat(originCoords),
-    destination_points: [{ ...toLonLat(destCoords), payload: 1 }],  // must include payload
+    destination_points: destCoordsList.map(c => ({ ...toLonLat(c), payload: 1 })),
     driver_details: {
       driver_name: vehicleId || "Driver-1",
-      vehicle_type: "car",
-      vehicle_capacity: 9999,   // generous defaults for now
-      maximum_distance: 100000, // meters
+      vehicle_type: vehicleType || "car",
+      vehicle_capacity: 9999,
+      maximum_distance: 100000,
     },
+    meta: {
+      origin_id: originIdValue === "__current_location__" ? null : originIdValue,
+      destination_ids: destIdsValue,
+      vehicle_id: vehicleId || null
+    }
   };
 
   const res = await fetch(`${ROUTE_API_BASE}/optimize_route`, {
@@ -972,11 +1333,8 @@ async function callBackendOptimizeRoute(originCoords, destCoords, vehicleId) {
   });
 
   const json = await res.json().catch(() => null);
-  if (!res.ok) {
-    const msg = json?.error || "Optimize route failed";
-    throw new Error(msg);
-  }
-  return json; // GeoJSON Feature
+  if (!res.ok) throw new Error(json?.error || "Optimize route failed");
+  return json;
 }
 
 // Basic HTML escaping for popup strings

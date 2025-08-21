@@ -23,6 +23,15 @@ export async function GET() {
     osrm: null,
   };
 
+  const backendBase = process.env.NEXT_PUBLIC_ROUTE_API_BASE || 'http://127.0.0.1:5000/api';
+  try {
+    const res = await fetchWithTimeout(`${backendBase}/ping`, { method: 'GET' });
+    const ok = res.ok;
+    checks.backend = { ok, status: res.status };
+  } catch (e) {
+    checks.backend = { ok: false, error: String(e) };
+  }
+
   try {
     // OSM tile (world tile 0/0/0 is safe)
     const osm = await fetchWithTimeout('https://tile.openstreetmap.org/0/0/0.png', { method: 'GET' });
