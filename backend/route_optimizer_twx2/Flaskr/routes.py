@@ -2,7 +2,11 @@ from flask import Blueprint, request, jsonify
 from flask_sse import sse
 from .utils import optimize_route, simulate_route, format_sse_data
 import threading
+import time
+import redis
 
+ORS_API_KEY = os.getenv("ORS_API_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
 
 # --- imports & Supabase REST config ---
 import os, requests
@@ -102,7 +106,6 @@ def optimize_route_alias():
 @route_bp.route("/ping", methods=["GET"])
 def ping():
     return jsonify({"ok": True, "service": "route-optimizer"}), 200
-
 
 # --- helper to persist to Supabase via PostgREST ---
 def persist_request_and_result(payload: dict, feature: dict):
@@ -243,3 +246,116 @@ def history_detail(req_id):
         status = getattr(e.response, "status_code", "n/a")
         text = getattr(e.response, "text", str(e))
         return jsonify({"error": f"supabase fetch failed (status {status}): {text}"}), 500
+
+# ── add near your other imports at the top of this file ─────────────────────────
+import time
+import redis  # already in requirements
+# (requests, os are already imported above)
+
+ORS_API_KEY = os.getenv("ORS_API_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
+
+# ── tiny helpers ────────────────────────────────────────────────────────────────
+def _check_redis():
+    if not REDIS_URL:
+        return {"status": "skipped", "latency_ms": 0, "reason": "REDIS_URL not set"}
+    t0 = time.time()
+    try:
+        r = redis.Redis.from_url(
+            REDIS_URL,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+            ssl=True if REDIS_URL.startswith("rediss://") else False,
+        )
+        r.ping()
+        return {"status": "ok", "latency_ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        return {"status": "error", "latency_ms": int((time.time() - t0) * 1000), "error": str(e)[:200]}
+
+def _check_routing_engine():
+    """
+    Prefer OpenRouteService if ORS_API_KEY exists; otherwise fall back to public OSRM.
+    """
+    t0 = time.time()
+    try:
+        if ORS_API_KEY:
+            resp = requests.get(
+                "https://api.openrouteservice.org/health",
+                headers={"Authorization": ORS_API_KEY},
+                timeout=2,
+            )
+            ok = 200 <= resp.status_code < 300
+            return {
+                "status": "ok" if ok else "degraded",
+                "latency_ms": int((time.time() - t0) * 1000),
+                "engine": "ors",
+                "code": resp.status_code,
+            }
+        # Fallback: OSRM public demo reachability
+        requests.head("https://router.project-osrm.org", timeout=2)
+        return {"status": "ok", "latency_ms": int((time.time() - t0) * 1000), "engine": "osrm"}
+    except Exception as e:
+        return {
+            "status": "error",
+            "latency_ms": int((time.time() - t0) * 1000),
+            "engine": "ors" if ORS_API_KEY else "osrm",
+            "error": str(e)[:200],
+        }
+
+def _check_supabase_rest():
+    """
+    Best-effort PostgREST check against your tables. If service key/URL not set,
+    we skip (that's fine when persistence is off).
+    """
+    if not (REST and SUPABASE_SERVICE_KEY):
+        return {"status": "skipped", "latency_ms": 0, "reason": "SUPABASE not configured"}
+    t0 = time.time()
+    try:
+        # simple, low-cost select; adjust table name if needed
+        r = requests.get(
+            f"{REST}/route_requests",
+            headers={**HEADERS, "Accept": "application/json"},
+            params={"select": "id", "limit": "1"},
+            timeout=3,
+        )
+        ok = 200 <= r.status_code < 300
+        return {
+            "status": "ok" if ok else "degraded",
+            "latency_ms": int((time.time() - t0) * 1000),
+            "code": r.status_code,
+        }
+    except Exception as e:
+        return {"status": "error", "latency_ms": int((time.time() - t0) * 1000), "error": str(e)[:200]}
+
+# ── expanded health route ───────────────────────────────────────────────────────
+@route_bp.route("/health", methods=["GET"])
+def health():
+    redis_res = _check_redis()
+    engine_res = _check_routing_engine()
+    db_res = _check_supabase_rest()
+
+    parts = (redis_res["status"], engine_res["status"], db_res["status"])
+    if any(s == "error" for s in parts):
+        overall = "degraded"   # keep HTTP 200 for platform probes
+    elif any(s == "degraded" for s in parts):
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    # Booleans aligned with the UI health bubbles
+    payload = {
+        "status": overall,
+        "backend": True,                                 # this endpoint responded
+        "osrm": engine_res["status"] in ("ok", "degraded"),
+        "db": db_res["status"] == "ok",
+        "redis": redis_res["status"] == "ok",
+        "tiles": True,                                   # tiles are client-side; mark true here
+        "checks": {
+            "redis": redis_res,
+            "engine": engine_res,
+            "supabase": db_res,
+        },
+        # helpful for debugging deployments
+        "version": os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT_SHA"),
+    }
+    return jsonify(payload), 200
