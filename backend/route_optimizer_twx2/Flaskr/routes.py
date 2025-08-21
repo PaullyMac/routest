@@ -4,12 +4,12 @@ from .utils import optimize_route, simulate_route, format_sse_data
 import threading
 import time
 import redis
+import os, requests
 
 ORS_API_KEY = os.getenv("ORS_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL")
 
 # --- imports & Supabase REST config ---
-import os, requests
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else None
