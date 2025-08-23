@@ -2,10 +2,16 @@ from flask import Blueprint, request, jsonify
 from flask_sse import sse
 from .utils import optimize_route, simulate_route, format_sse_data
 import threading
+import time
+import redis
+import os, requests
+import datetime as dt
+from .ml import predict_eta_minutes
 
+ORS_API_KEY = os.getenv("ORS_API_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
 
 # --- imports & Supabase REST config ---
-import os, requests
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else None
@@ -82,13 +88,34 @@ def update_tracker():
 
 @route_bp.route('/optimize_route', methods=['POST'])
 def optimize_route_alias():
-    # same behavior as /request_route for the frontend “later” switch, but now we persist
     payload = request.get_json(silent=True) or {}
     result = optimize_route(payload)
     if isinstance(result, dict) and result.get("error"):
         return jsonify(result), 400
 
-    # --- NEW: persist best-effort (don’t fail the API if DB write fails)
+    # --- Optional ML ETA when requested (compute BEFORE persisting) ---
+    if payload.get("use_ml_eta"):
+        props = result.setdefault("properties", {}) or {}
+        summary = props.get("summary", {}) or {}
+        distance_m = float(summary.get("distance") or 0)
+
+        ctx = payload.get("context") or {}
+        weather = ctx.get("weather", "Sunny")
+        traffic = ctx.get("traffic", "Low")
+        driver_age = float((payload.get("driver_details") or {}).get("driver_age", 30))
+
+        eta_min, eta_iso = predict_eta_minutes(
+            weather=weather,
+            traffic=traffic,
+            distance_m=distance_m,
+            pickup_time=dt.datetime.now(),
+            driver_age=driver_age,
+        )
+        if eta_min is not None:
+            props["eta_minutes_ml"] = eta_min
+            props["eta_completion_time_ml"] = eta_iso
+
+    # --- best-effort persistence (now includes engine + ML fields) ---
     try:
         req_id = persist_request_and_result(payload, result)
         if req_id:
@@ -103,33 +130,40 @@ def optimize_route_alias():
 def ping():
     return jsonify({"ok": True, "service": "route-optimizer"}), 200
 
-
 # --- helper to persist to Supabase via PostgREST ---
 def persist_request_and_result(payload: dict, feature: dict):
     if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
         return None
 
     meta = payload.get("meta") or {}
+    driver = payload.get("driver_details") or {}
+    engine = "ml" if payload.get("use_ml_eta") else "default"
+
     stops = {
         "destination_ids": meta.get("destination_ids") or [],
         "destination_points": payload.get("destination_points") or [],
     }
+
+    # --- route_requests row ---
     req_row = {
         "origin_id": meta.get("origin_id"),
-        "stops": stops,            # jsonb NOT NULL
+        "stops": stops,                        # jsonb NOT NULL
         "status": "completed",
+        "engine": engine,
+        "vehicle_id": driver.get("driver_name"),
+        "driver_age": driver.get("driver_age"),
     }
-
     r = requests.post(f"{REST}/route_requests", headers=HEADERS, json=req_row, timeout=20)
     if not r.ok:
-        print("route_requests insert failed:", r.status_code, r.text)   # <— show body
+        print("route_requests insert failed:", r.status_code, r.text)
         r.raise_for_status()
     request_id = r.json()[0]["id"]
 
-    props = (feature or {}).get("properties", {}) or {}
+    props   = (feature or {}).get("properties", {}) or {}
     summary = props.get("summary", {}) or {}
-    legs = props.get("segments", []) or []
+    legs    = props.get("segments", []) or []
 
+    # --- route_results row (with ML fields if present) ---
     result_row = {
         "request_id": request_id,
         "total_distance": float(summary.get("distance") or 0),
@@ -137,6 +171,8 @@ def persist_request_and_result(payload: dict, feature: dict):
         "optimized_order": props.get("optimized_order") or [],
         "legs": legs,
         "geometry": feature.get("geometry") or None,
+        "eta_minutes_ml": props.get("eta_minutes_ml"),
+        "eta_completion_time_ml": props.get("eta_completion_time_ml"),
     }
     r2 = requests.post(f"{REST}/route_results", headers=HEADERS, json=result_row, timeout=20)
     if not r2.ok:
@@ -154,12 +190,10 @@ def history():
         limit = 20
     limit = max(1, min(limit, 100))
 
-    # Your schema: id, origin_id, stops, request_time, status
-    # route_results has created_at, totals, optimized_order
     params = {
         "select": (
-            "id,request_time,origin_id,stops,"
-            "route_results(id,total_distance,total_duration,optimized_order,created_at)"
+            "id,request_time,origin_id,stops,engine,vehicle_id,driver_age,"
+            "route_results(id,total_distance,total_duration,optimized_order,created_at,eta_minutes_ml,eta_completion_time_ml)"
         ),
         "order": "request_time.desc",
         "limit": str(limit),
@@ -182,12 +216,16 @@ def history():
         dest_ids = stops.get("destination_ids") or []
         items.append({
             "request_id": rr["id"],
-            "created_at": rr.get("request_time"),   # <- from your schema
+            "created_at": rr.get("request_time"),
             "origin_id": rr.get("origin_id"),
             "dest_count": len(dest_ids),
             "total_distance": first.get("total_distance"),
             "total_duration": first.get("total_duration"),
             "optimized": bool(first.get("optimized_order") or []),
+            "engine": rr.get("engine") or "default",
+            "vehicle_id": rr.get("vehicle_id"),
+            "eta_minutes_ml": first.get("eta_minutes_ml"),
+            "eta_completion_time_ml": first.get("eta_completion_time_ml"),
         })
 
     return jsonify({"items": items}), 200
@@ -195,14 +233,6 @@ def history():
 # --- History detail ----------------------------------------------------------
 @route_bp.route("/history/<req_id>", methods=["GET"])
 def history_detail(req_id):
-    """
-    Returns one saved route request + its (first) result.
-    Shape:
-    {
-      "request": { id, origin_id, stops, status, request_time },
-      "result":  { total_distance, total_duration, optimized_order, legs, created_at }
-    }
-    """
     if not (REST and SUPABASE_SERVICE_KEY):
         return jsonify({"error": "history disabled: SUPABASE not configured"}), 503
 
@@ -211,9 +241,10 @@ def history_detail(req_id):
             f"{REST}/route_requests",
             headers=HEADERS,
             params={
-                # include the embedded 1:N results as an array `route_results`
-                "select": "id,origin_id,stops,status,request_time,"
-                          "route_results(id,total_distance,total_duration,optimized_order,legs,created_at)",
+                "select": (
+                    "id,origin_id,stops,status,request_time,engine,vehicle_id,driver_age,"
+                    "route_results(id,total_distance,total_duration,optimized_order,legs,created_at,eta_minutes_ml,eta_completion_time_ml,geometry)"
+                ),
                 "id": f"eq.{req_id}",
                 "limit": "1",
             },
@@ -235,6 +266,9 @@ def history_detail(req_id):
                 "stops": req.get("stops") or {},
                 "status": req.get("status"),
                 "request_time": req.get("request_time"),
+                "engine": req.get("engine") or "default",
+                "vehicle_id": req.get("vehicle_id"),
+                "driver_age": req.get("driver_age"),
             },
             "result": res
         }), 200
@@ -243,3 +277,130 @@ def history_detail(req_id):
         status = getattr(e.response, "status_code", "n/a")
         text = getattr(e.response, "text", str(e))
         return jsonify({"error": f"supabase fetch failed (status {status}): {text}"}), 500
+
+# ── tiny helpers ────────────────────────────────────────────────────────────────
+def _check_redis():
+    if not REDIS_URL:
+        return {"status": "skipped", "latency_ms": 0, "reason": "REDIS_URL not set"}
+    t0 = time.time()
+    try:
+        # NOTE: TLS is inferred from rediss:// — do not pass ssl= for redis-py 6.x
+        r = redis.Redis.from_url(
+            REDIS_URL,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+        )
+        r.ping()
+        return {"status": "ok", "latency_ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        return {"status": "error", "latency_ms": int((time.time() - t0) * 1000), "error": str(e)[:200]}
+
+def _check_routing_engine():
+    """Treat any HTTP response from ORS as reachable; only network errors are 'error'."""
+    t0 = time.time()
+    try:
+        head = requests.head("https://api.openrouteservice.org", timeout=2)
+        # If you have a key, make a lightweight GET to confirm authenticated path reachability.
+        code = head.status_code
+        status = "ok" if 200 <= code < 400 else "degraded"
+        if ORS_API_KEY:
+            try:
+                r = requests.get(
+                    "https://api.openrouteservice.org/health",
+                    headers={"Authorization": ORS_API_KEY},
+                    timeout=2,
+                )
+                # 2xx => ok; 401/403/404 => degraded but reachable
+                status = "ok" if 200 <= r.status_code < 300 else "degraded"
+                code = r.status_code
+            except Exception:
+                # keep prior reachability result
+                pass
+        return {
+            "status": status,
+            "latency_ms": int((time.time() - t0) * 1000),
+            "engine": "ors",
+            "code": code,
+        }
+    except Exception as e:
+        return {"status": "error", "latency_ms": int((time.time() - t0) * 1000), "engine": "ors", "error": str(e)[:200]}
+
+def _check_supabase_rest():
+    if not (REST and SUPABASE_SERVICE_KEY):
+        return {"status": "skipped", "latency_ms": 0, "reason": "SUPABASE not configured"}
+    t0 = time.time()
+    try:
+        r = requests.get(f"{REST}/route_requests", headers=HEADERS, params={"select": "id", "limit": "1"}, timeout=3)
+        return {"status": "ok" if 200 <= r.status_code < 300 else "degraded",
+                "latency_ms": int((time.time() - t0) * 1000), "code": r.status_code}
+    except Exception as e:
+        return {"status": "error", "latency_ms": int((time.time() - t0) * 1000), "error": str(e)[:200]}
+
+@route_bp.route("/health", methods=["GET"])
+def health():
+    redis_res = _check_redis()
+    engine_res = _check_routing_engine()
+    db_res = _check_supabase_rest()
+
+    parts = (redis_res["status"], engine_res["status"], db_res["status"])
+    if any(s == "error" for s in parts):
+        overall = "degraded"   # keep HTTP 200 for Render probes
+    elif any(s == "degraded" for s in parts):
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    payload = {
+        "backend": True,
+        "checks": {"engine": engine_res, "redis": redis_res, "supabase": db_res},
+        "db": db_res["status"] == "ok",
+        "osrm": engine_res["status"] in ("ok", "degraded"),
+        "redis": redis_res["status"] == "ok",
+        "tiles": True,
+        "status": overall,
+        "version": os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT_SHA"),
+    }
+    return jsonify(payload), 200
+
+@route_bp.route("/predict_eta", methods=["POST"])
+def predict_eta_endpoint():
+    body = request.get_json(silent=True) or {}
+    summary = body.get("summary") or {}
+    pickup = body.get("pickup_time") or dt.datetime.now().isoformat()
+    driver_age = float(body.get("driver_age", 30))
+    weather = body.get("weather", "Sunny")
+    traffic = body.get("traffic", "Low")
+
+    eta_min, eta_iso = predict_eta_minutes(
+        weather=weather,
+        traffic=traffic,
+        distance_m=float(summary.get("distance") or 0),
+        pickup_time=pickup,
+        driver_age=driver_age,
+    )
+    if eta_min is None:
+        return jsonify({"error": "model unavailable"}), 503
+    return jsonify({"eta_minutes_ml": eta_min, "eta_completion_time_ml": eta_iso}), 200
+
+# DELETE /history/<request_id>  — remove one saved route (FK cascade to route_results)
+@route_bp.route("/history/<req_id>", methods=["DELETE"])
+def delete_history(req_id):
+    if not (REST and SUPABASE_SERVICE_KEY):
+        return jsonify({"error": "history disabled: SUPABASE not configured"}), 503
+
+    try:
+        headers = dict(HEADERS)       # avoid asking PostgREST to return the deleted rows
+        headers.pop("Prefer", None)
+        r = requests.delete(
+            f"{REST}/route_requests",
+            headers=headers,
+            params={"id": f"eq.{req_id}"},
+            timeout=10,
+        )
+        if r.status_code not in (200, 204):
+            return jsonify({"error": f"delete failed: {r.status_code} {r.text}"}), 500
+        return ("", 204)
+    except requests.RequestException as e:
+        status = getattr(e.response, "status_code", "n/a")
+        text = getattr(e.response, "text", str(e))
+        return jsonify({"error": f"supabase delete failed (status {status}): {text}"}), 500
