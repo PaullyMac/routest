@@ -67,20 +67,37 @@ export default function DashboardPage() {
       let totalCompletion = 0;
       let validCompletionCount = 0;
 
-      joined.forEach((row) => {
-        if (row.vehicle_id) vehicleCounts[row.vehicle_id] = (vehicleCounts[row.vehicle_id] || 0) + 1;
-        if (row.driver_age) ageCounts[row.driver_age] = (ageCounts[row.driver_age] || 0) + 1;
-
-        if (row.legs && Array.isArray(row.legs)) {
-          row.legs.forEach((leg) => {
-            if (leg.name) legCounts[leg.name] = (legCounts[leg.name] || 0) + 1;
-          });
-        } else if (row.legs && typeof row.legs === "object") {
-          // if legs is object with segments array
-          Object.values(row.legs).forEach((segment) => {
-            if (segment.name) legCounts[segment.name] = (legCounts[segment.name] || 0) + 1;
-          });
+      const getLegKey = (leg) => {
+        if (!leg || typeof leg !== "object") return null;
+        const distance =
+          leg.distance ?? leg.distance_meters ?? leg.summary?.distance;
+        const duration =
+          leg.duration ?? leg.duration_seconds ?? leg.summary?.duration;
+        if (typeof distance === "number" && typeof duration === "number") {
+          return `${(distance / 1000).toFixed(1)} km / ${(
+            duration / 60
+          ).toFixed(1)} min`;
         }
+        return JSON.stringify(leg);
+      };
+
+      joined.forEach((row) => {
+        if (row.vehicle_id)
+          vehicleCounts[row.vehicle_id] =
+            (vehicleCounts[row.vehicle_id] || 0) + 1;
+        if (row.driver_age)
+          ageCounts[row.driver_age] = (ageCounts[row.driver_age] || 0) + 1;
+
+        const legsArray = Array.isArray(row.legs)
+          ? row.legs
+          : row.legs && typeof row.legs === "object"
+          ? Object.values(row.legs)
+          : [];
+        legsArray.forEach((leg) => {
+          const key = getLegKey(leg);
+          if (key)
+            legCounts[key] = (legCounts[key] || 0) + 1;
+        });
 
         if (row.eta_completion_time_ml) {
           totalCompletion += new Date(row.eta_completion_time_ml).getTime();
